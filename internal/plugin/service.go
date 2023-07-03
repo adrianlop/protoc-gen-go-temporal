@@ -18,6 +18,7 @@ const (
 	enumsPkg      = "go.temporal.io/api/enums/v1"
 	expressionPkg = "github.com/cludden/protoc-gen-go-temporal/pkg/expression"
 	temporalPkg   = "go.temporal.io/sdk/temporal"
+	testsuitePkg  = "go.temporal.io/sdk/testsuite"
 	updatePkg     = "go.temporal.io/api/update/v1"
 	uuidPkg       = "github.com/google/uuid"
 	workflowPkg   = "go.temporal.io/sdk/workflow"
@@ -393,5 +394,62 @@ func (svc *Service) render(f *g.File) {
 		svc.genActivityFutureSelectMethod(f, activity)
 		svc.genActivityFunction(f, activity, false)
 		svc.genActivityFunction(f, activity, true)
+	}
+
+	// generate test client
+	svc.genTestClientImpl(f)
+	svc.genTestClientImplNewMethod(f)
+	for _, workflow := range svc.workflowsOrdered {
+		svc.genTestClientImplWorkflowMethod(f, workflow)
+		svc.genTestClientImplWorkflowAsyncMethod(f, workflow)
+		svc.genTestClientImplWorkflowGetMethod(f, workflow)
+		for _, signal := range svc.workflows[workflow].GetSignal() {
+			if !signal.GetStart() {
+				continue
+			}
+			svc.genTestClientImplWorkflowWithSignalMethod(f, workflow, signal.GetRef())
+			svc.genTestClientImplWorkflowWithSignalAsyncMethod(f, workflow, signal.GetRef())
+		}
+	}
+
+	// generate test client query methods
+	for _, query := range svc.queriesOrdered {
+		svc.genTestClientImplQueryMethod(f, query)
+	}
+
+	// generate test client signal methods
+	for _, signal := range svc.signalsOrdered {
+		svc.genTestClientImplSignalMethod(f, signal)
+	}
+
+	// generate test client update methods
+	for _, update := range svc.updatesOrdered {
+		svc.genTestClientImplUpdateMethod(f, update)
+		svc.genTestClientImplUpdateAsyncMethod(f, update)
+	}
+
+	// generate workflow test runs
+	for _, workflow := range svc.workflowsOrdered {
+		opts := svc.workflows[workflow]
+		svc.genTestClientWorkflowRunImpl(f, workflow)
+		svc.genTestClientWorkflowRunImplGetMethod(f, workflow)
+		svc.genTestClientWorkflowRunImplIDMethod(f, workflow)
+		svc.genTestClientWorkflowRunImplRunIDMethod(f, workflow)
+
+		// generate query methods
+		for _, queryOpts := range opts.GetQuery() {
+			svc.genTestClientWorkflowRunImplQueryMethod(f, workflow, queryOpts.GetRef())
+		}
+
+		// generate signal methods
+		for _, signalOpts := range opts.GetSignal() {
+			svc.genTestClientWorkflowRunImplSignalMethod(f, workflow, signalOpts.GetRef())
+		}
+
+		// generate update methods
+		for _, updateOpts := range opts.GetUpdate() {
+			svc.genTestClientWorkflowRunImplUpdateMethod(f, workflow, updateOpts.GetRef())
+			svc.genTestClientWorkflowRunImplUpdateAsyncMethod(f, workflow, updateOpts.GetRef())
+		}
 	}
 }

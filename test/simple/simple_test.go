@@ -11,6 +11,7 @@ import (
 	"github.com/ory/dockertest/v3"
 	"github.com/stretchr/testify/require"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/worker"
 )
 
@@ -49,6 +50,53 @@ func TestSomeWorkflow1(t *testing.T) {
 
 	// initialize simple client
 	client := simplepb.NewClient(c)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// start the workflow
+	run, err := client.SomeWorkflow1Async(ctx, &simplepb.SomeWorkflow1Request{
+		Id:         "foo",
+		RequestVal: "some request",
+	})
+	require.NoError(err)
+	require.Regexp("^some-workflow-1/foo/.{32}", run.ID())
+
+	// send signals
+	require.NoError(run.SomeSignal1(ctx))
+	require.NoError(run.SomeSignal2(ctx, &simplepb.SomeSignal2Request{RequestVal: "foo"}))
+
+	// query until we get the right events
+	require.Eventually(func() bool {
+		resp, err := run.SomeQuery1(ctx)
+		require.NoError(err)
+		for _, item := range []string{
+			"started with param some request",
+			"some activity 3 with response some response",
+			"some local activity 3 with response some response",
+			"some query 1",
+		} {
+			require.Contains(resp.GetResponseVal(), item)
+		}
+		return true
+	}, 2*time.Second, 200*time.Millisecond)
+
+	// Check the activity events
+	require.Equal([]string{
+		"some activity 3 with param some activity param",
+		"some activity 3 with param some local activity param",
+	}, simple.ActivityEvents)
+
+	resp, err := run.Get(ctx)
+	require.NoError(err)
+	require.NotNil(resp)
+}
+
+func TestSomeWorkflow1WithTestClient(t *testing.T) {
+	require := require.New(t)
+	suite := &testsuite.WorkflowTestSuite{}
+	env := suite.NewTestWorkflowEnvironment()
+	client := simplepb.NewTestClient(env, &simple.Workflows{})
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

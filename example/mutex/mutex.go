@@ -139,8 +139,9 @@ type Activites struct {
 
 // Mutex locks a shared resource and can be called from a parent workflow
 func (a *Activites) Mutex(ctx context.Context, req *mutexv1.MutexRequest) error {
-	return a.Client.MutexWithAcquireLease(ctx, req, &mutexv1.AcquireLeaseRequest{
+	_, err := a.Client.MutexWithAcquireLeaseAsync(ctx, req, &mutexv1.AcquireLeaseRequest{
 		WorkflowId: activity.GetInfo(ctx).WorkflowExecution.ID,
 		Timeout:    durationpb.New(time.Minute * 2),
 	})
+	return err
 }
