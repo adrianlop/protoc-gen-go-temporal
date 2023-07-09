@@ -24,6 +24,15 @@ const (
 	workerPkg     = "go.temporal.io/sdk/worker"
 )
 
+// method modes
+const (
+	modeActivity uint8 = 1 << iota
+	modeQuery
+	modeSignal
+	modeUpdate
+	modeWorkflow
+)
+
 // Service describes a temporal protobuf service definition
 type Service struct {
 	*protogen.Plugin
@@ -64,32 +73,47 @@ func parseService(p *protogen.Plugin, file *protogen.File, service *protogen.Ser
 	for _, method := range service.Methods {
 		name := method.GoName
 		svc.methods[name] = method
+		var mode uint8
 
 		if opts, ok := proto.GetExtension(method.Desc.Options(), temporalv1.E_Activity).(*temporalv1.ActivityOptions); ok && opts != nil {
 			svc.activities[name] = opts
 			svc.activitiesOrdered = append(svc.activitiesOrdered, name)
-		}
-
-		if opts, ok := proto.GetExtension(method.Desc.Options(), temporalv1.E_Query).(*temporalv1.QueryOptions); ok && opts != nil {
-			svc.queries[name] = opts
-			svc.queriesOrdered = append(svc.queriesOrdered, name)
-		}
-
-		if opts, ok := proto.GetExtension(method.Desc.Options(), temporalv1.E_Signal).(*temporalv1.SignalOptions); ok && opts != nil {
-			svc.signals[name] = opts
-			svc.signalsOrdered = append(svc.signalsOrdered, name)
-		}
-
-		if svc.opts.GetFeatures().GetWorkflowUpdate().GetEnabled() {
-			if opts, ok := proto.GetExtension(method.Desc.Options(), temporalv1.E_Update).(*temporalv1.UpdateOptions); ok && opts != nil {
-				svc.updates[name] = opts
-				svc.updatesOrdered = append(svc.updatesOrdered, name)
-			}
+			mode |= modeActivity
 		}
 
 		if opts, ok := proto.GetExtension(method.Desc.Options(), temporalv1.E_Workflow).(*temporalv1.WorkflowOptions); ok && opts != nil {
 			svc.workflows[name] = opts
 			svc.workflowsOrdered = append(svc.workflowsOrdered, name)
+			mode |= modeWorkflow
+		}
+
+		if opts, ok := proto.GetExtension(method.Desc.Options(), temporalv1.E_Query).(*temporalv1.QueryOptions); ok && opts != nil {
+			if mode > 0 {
+				return nil, fmt.Errorf("error parsing %q method: query is incompatible with other method options", method.Desc.FullName())
+			}
+			svc.queries[name] = opts
+			svc.queriesOrdered = append(svc.queriesOrdered, name)
+			mode |= modeQuery
+		}
+
+		if opts, ok := proto.GetExtension(method.Desc.Options(), temporalv1.E_Signal).(*temporalv1.SignalOptions); ok && opts != nil {
+			if mode > 0 {
+				return nil, fmt.Errorf("error parsing %q method: signal is incompatible with other method options", method.Desc.FullName())
+			}
+			svc.signals[name] = opts
+			svc.signalsOrdered = append(svc.signalsOrdered, name)
+			mode |= modeSignal
+		}
+
+		if svc.opts.GetFeatures().GetWorkflowUpdate().GetEnabled() {
+			if opts, ok := proto.GetExtension(method.Desc.Options(), temporalv1.E_Update).(*temporalv1.UpdateOptions); ok && opts != nil {
+				if mode > 0 {
+					return nil, fmt.Errorf("error parsing %q method: update is incompatible with other method options", method.Desc.FullName())
+				}
+				svc.updates[name] = opts
+				svc.updatesOrdered = append(svc.updatesOrdered, name)
+				mode |= modeUpdate
+			}
 		}
 	}
 	sort.Strings(svc.activitiesOrdered)
@@ -130,11 +154,7 @@ func parseService(p *protogen.Plugin, file *protogen.File, service *protogen.Ser
 	// ensure that signals return no value, unless signal method is also an activity, query, and/or workflow
 	for _, signal := range svc.signalsOrdered {
 		handler := svc.methods[signal]
-		_, isActivity := svc.activities[signal]
-		_, isQuery := svc.queries[signal]
-		_, isUpdate := svc.updates[signal]
-		_, isWorkflow := svc.workflows[signal]
-		if !isActivity && !isQuery && !isUpdate && !isWorkflow && !isEmpty(handler.Output) {
+		if !isEmpty(handler.Output) {
 			errs = errors.Join(errs, fmt.Errorf("expected signal %q output to be google.protobuf.Empty, got: %s", signal, handler.Output.GoIdent.GoName))
 		}
 	}
@@ -145,8 +165,8 @@ func parseService(p *protogen.Plugin, file *protogen.File, service *protogen.Ser
 func (svc *Service) genConstants(f *g.File) {
 	// add task queue
 	if taskQueue := svc.opts.GetTaskQueue(); taskQueue != "" {
-		f.Commentf("%sTaskQueue is the default task-queue for a %s worker", svc.GoName, svc.GoName)
-		f.Const().Id(fmt.Sprintf("%sTaskQueue", svc.GoName)).Op("=").Lit(taskQueue)
+		f.Commentf("%s is the default task-queue for a %s worker", svc.Names().TaskQueue(), svc.GoName)
+		f.Const().Id(svc.Names().TaskQueue()).Op("=").Lit(taskQueue)
 	}
 
 	// add workflow names
@@ -154,13 +174,7 @@ func (svc *Service) genConstants(f *g.File) {
 		f.Commentf("%s workflow names", svc.GoName)
 		f.Const().DefsFunc(func(defs *g.Group) {
 			for _, workflow := range svc.workflowsOrdered {
-				method := svc.methods[workflow]
-				opts := svc.workflows[workflow]
-				name := opts.GetName()
-				if name == "" {
-					name = string(method.Desc.FullName())
-				}
-				defs.Id(fmt.Sprintf("%sWorkflowName", workflow)).Op("=").Lit(name)
+				defs.Id(svc.Names().WorkflowNameConstant(workflow)).Op("=").Lit(svc.Names().WorkflowName(workflow))
 			}
 		})
 	}
@@ -177,7 +191,7 @@ func (svc *Service) genConstants(f *g.File) {
 		f.Commentf("%s workflow id expressions", svc.GoName)
 		f.Var().DefsFunc(func(defs *g.Group) {
 			for _, pair := range workflowIdExpressions {
-				defs.Id(fmt.Sprintf("%sIDExpression", pair[0])).Op("=").Qual(expressionPkg, "MustParseExpression").Call(g.Lit(pair[1]))
+				defs.Id(svc.Names().IDExpression(pair[0])).Op("=").Qual(expressionPkg, "MustParseExpression").Call(g.Lit(pair[1]))
 			}
 		})
 	}
@@ -194,7 +208,7 @@ func (svc *Service) genConstants(f *g.File) {
 		f.Commentf("%s workflow search attribute mappings", svc.GoName)
 		f.Var().DefsFunc(func(defs *g.Group) {
 			for _, pair := range workflowSearchAttributes {
-				defs.Id(fmt.Sprintf("%sSearchAttributesMapping", pair[0])).Op("=").Qual(expressionPkg, "MustParseMapping").Call(g.Lit(pair[1]))
+				defs.Id(svc.Names().WorkflowSearchAttributesMapping(pair[0])).Op("=").Qual(expressionPkg, "MustParseMapping").Call(g.Lit(pair[1]))
 			}
 		})
 	}
@@ -204,13 +218,7 @@ func (svc *Service) genConstants(f *g.File) {
 		f.Commentf("%s activity names", svc.GoName)
 		f.Const().DefsFunc(func(defs *g.Group) {
 			for _, activity := range svc.activitiesOrdered {
-				method := svc.methods[activity]
-				opts := svc.activities[activity]
-				name := opts.GetName()
-				if name == "" {
-					name = string(method.Desc.FullName())
-				}
-				defs.Id(fmt.Sprintf("%sActivityName", activity)).Op("=").Lit(name)
+				defs.Id(svc.Names().ActivityNameConstant(activity)).Op("=").Lit(svc.Names().ActivityName(activity))
 			}
 		})
 	}
@@ -220,13 +228,7 @@ func (svc *Service) genConstants(f *g.File) {
 		f.Commentf("%s query names", svc.GoName)
 		f.Const().DefsFunc(func(defs *g.Group) {
 			for _, query := range svc.queriesOrdered {
-				method := svc.methods[query]
-				opts := svc.queries[query]
-				name := opts.GetName()
-				if name == "" {
-					name = string(method.Desc.FullName())
-				}
-				defs.Id(fmt.Sprintf("%sQueryName", query)).Op("=").Lit(name)
+				defs.Id(svc.Names().QueryNameConstant(query)).Op("=").Lit(svc.Names().QueryName(query))
 			}
 		})
 	}
@@ -236,13 +238,7 @@ func (svc *Service) genConstants(f *g.File) {
 		f.Commentf("%s signal names", svc.GoName)
 		f.Const().DefsFunc(func(defs *g.Group) {
 			for _, signal := range svc.signalsOrdered {
-				method := svc.methods[signal]
-				opts := svc.signals[signal]
-				name := opts.GetName()
-				if name == "" {
-					name = string(method.Desc.FullName())
-				}
-				defs.Id(fmt.Sprintf("%sSignalName", signal)).Op("=").Lit(name)
+				defs.Id(svc.Names().UpdateNameConstant(signal)).Op("=").Lit(svc.Names().SignalName(signal))
 			}
 		})
 	}
@@ -252,13 +248,7 @@ func (svc *Service) genConstants(f *g.File) {
 		f.Commentf("%s update names", svc.GoName)
 		f.Const().DefsFunc(func(defs *g.Group) {
 			for _, update := range svc.updatesOrdered {
-				method := svc.methods[update]
-				opts := svc.updates[update]
-				name := opts.GetName()
-				if name == "" {
-					name = string(method.Desc.FullName())
-				}
-				defs.Id(fmt.Sprintf("%sUpdateName", update)).Op("=").Lit(name)
+				defs.Id(svc.Names().UpdateNameConstant(update)).Op("=").Lit(svc.Names().UpdateName(update))
 			}
 		})
 	}
@@ -275,7 +265,7 @@ func (svc *Service) genConstants(f *g.File) {
 		f.Commentf("%s update id expressions", svc.GoName)
 		f.Var().DefsFunc(func(defs *g.Group) {
 			for _, pair := range updateIdExpressions {
-				defs.Id(fmt.Sprintf("%sIDExpression", pair[0])).Op("=").Qual(expressionPkg, "MustParseExpression").Call(g.Lit(pair[1]))
+				defs.Id(svc.Names().IDExpression(pair[0])).Op("=").Qual(expressionPkg, "MustParseExpression").Call(g.Lit(pair[1]))
 			}
 		})
 	}
@@ -360,22 +350,38 @@ func (svc *Service) render(f *g.File) {
 	svc.genWorkerWorkflowsInterface(f)
 	svc.genWorkerRegisterWorkflows(f)
 
+	// generate workflow resources
+	svc.genWorkerWorkflowResources(f)
+	for _, activity := range svc.activitiesOrdered {
+		svc.genWorkerWorkflowResourcesActivityMethod(f, activity, false, false)
+		svc.genWorkerWorkflowResourcesActivityMethod(f, activity, false, true)
+		svc.genWorkerWorkflowResourcesActivityMethod(f, activity, true, false)
+		svc.genWorkerWorkflowResourcesActivityMethod(f, activity, true, true)
+	}
+	for _, signal := range svc.signalsOrdered {
+		svc.genWorkerWorkflowResourcesSignalExternal(f, signal)
+	}
+	for _, workflow := range svc.workflowsOrdered {
+		svc.genWorkerWorkflowResourcesChildWorkflowMethod(f, workflow)
+		svc.genWorkerWorkflowResourcesChildWorkflowAsyncMethod(f, workflow)
+	}
+
 	// generate workflow types, methods, functions
 	for _, workflow := range svc.workflowsOrdered {
 		svc.genWorkerRegisterWorkflow(f, workflow)
-		svc.genWorkerBuilderFunction(f, workflow)
-		svc.genWorker(f, workflow)
-		svc.genWorkerExecuteMethod(f, workflow)
+		svc.genWorkerWorkflowBuilder(f, workflow)
+		//svc.genWorkerWorkflowFactory(f, workflow)
+		//svc.genWorkerWorkflowFactoryExecuteMethod(f, workflow)
 		svc.genWorkerWorkflowInput(f, workflow)
 		svc.genWorkerWorkflowInterface(f, workflow)
-		svc.genWorkerChildWorkflow(f, workflow)
-		svc.genWorkerChildWorkflowAsync(f, workflow)
-		svc.genWorkerWorkflowChildRun(f, workflow)
-		svc.genWorkerWorkflowChildRunGet(f, workflow)
-		svc.genWorkerWorkflowChildRunSelect(f, workflow)
-		svc.genWorkerWorkflowChildRunSelectStart(f, workflow)
-		svc.genWorkerWorkflowChildRunWaitStart(f, workflow)
-		svc.genWorkerWorkflowChildRunSignals(f, workflow)
+		svc.genWorkerWorkflowResourcesChildWorkflowMethod(f, workflow)
+		svc.genWorkerWorkflowResourcesChildWorkflowAsyncMethod(f, workflow)
+		svc.genWorkerWorkflowChildRunImpl(f, workflow)
+		svc.genWorkerWorkflowChildRunImplGetMethod(f, workflow)
+		svc.genWorkerWorkflowChildRunImplSelectMethod(f, workflow)
+		svc.genWorkerWorkflowChildRunImplSelectStartMethod(f, workflow)
+		svc.genWorkerWorkflowChildRunIpmlWaitStartMethod(f, workflow)
+		svc.genWorkerWorkflowChildRunImplSignalMethods(f, workflow)
 	}
 
 	// generate signal types, methods, functions
@@ -384,7 +390,7 @@ func (svc *Service) render(f *g.File) {
 		svc.genWorkerSignalReceive(f, signal)
 		svc.genWorkerSignalReceiveAsync(f, signal)
 		svc.genWorkerSignalSelect(f, signal)
-		svc.genWorkerSignalExternal(f, signal)
+		svc.genWorkerWorkflowResourcesSignalExternal(f, signal)
 	}
 
 	// generate activities
@@ -395,9 +401,5 @@ func (svc *Service) render(f *g.File) {
 		svc.genActivityFuture(f, activity)
 		svc.genActivityFutureGetMethod(f, activity)
 		svc.genActivityFutureSelectMethod(f, activity)
-		svc.genActivityFunction(f, activity, false, false)
-		svc.genActivityFunction(f, activity, false, true)
-		svc.genActivityFunction(f, activity, true, false)
-		svc.genActivityFunction(f, activity, true, true)
 	}
 }

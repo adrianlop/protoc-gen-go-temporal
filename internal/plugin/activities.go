@@ -2,8 +2,6 @@ package plugin
 
 import (
 	"fmt"
-	"sort"
-	"strconv"
 	"strings"
 
 	g "github.com/dave/jennifer/jen"
@@ -11,14 +9,26 @@ import (
 
 // genActivitiesInterface generates an Activities interface
 func (svc *Service) genActivitiesInterface(f *g.File) {
-	f.Comment("Activities describes available worker activites")
-	f.Type().Id("Activities").InterfaceFunc(func(methods *g.Group) {
+	typeName := svc.Names().ActivitiesInterface()
+	f.Commentf("%s describes available worker activites", typeName)
+	f.Type().Id(typeName).InterfaceFunc(func(methods *g.Group) {
+		// define activity methods
 		for _, activity := range svc.activitiesOrdered {
 			method := svc.methods[activity]
-			methods.Comment(strings.TrimSuffix(method.Comments.Leading.String(), "\n"))
 			hasInput := !isEmpty(method.Input)
 			hasOutput := !isEmpty(method.Output)
-			methods.Id(activity).
+			methodName := svc.Names().ActivityGoName(activity)
+			activityName := svc.Names().ActivityName(activity)
+
+			desc := method.Comments.Leading.String()
+			if desc != "" {
+				desc = strings.TrimSpace(strings.ReplaceAll(strings.TrimPrefix(desc, "//"), "\n//", ""))
+			} else {
+				desc = fmt.Sprintf("%s executes a %s signal", methodName, activityName)
+			}
+
+			methods.Comment(desc)
+			methods.Id(methodName).
 				ParamsFunc(func(args *g.Group) {
 					args.Id("ctx").Qual("context", "Context")
 					if hasInput {
@@ -37,16 +47,19 @@ func (svc *Service) genActivitiesInterface(f *g.File) {
 
 // genActivitiesInterface generates a RegisterActivities public function
 func (svc *Service) genRegisterActivities(f *g.File) {
-	f.Comment("RegisterActivities registers activities with a worker")
-	f.Func().Id("RegisterActivities").
+	methodName := svc.Names().RegisterActivities()
+	interfaceName := svc.Names().ActivitiesInterface()
+	f.Commentf("%s registers %s activities with a worker", methodName, svc.GoName)
+	f.Func().Id(methodName).
 		Params(
 			g.Id("r").Qual(workerPkg, "Registry"),
-			g.Id("activities").Id("Activities"),
+			g.Id("activities").Id(interfaceName),
 		).
 		BlockFunc(func(fn *g.Group) {
 			for _, activity := range svc.activitiesOrdered {
-				fn.Id(fmt.Sprintf("Register%sActivity", activity)).Call(
-					g.Id("r"), g.Id("activities").Dot(activity),
+				methodName = svc.Names().ActivityGoName(activity)
+				fn.Id(methodName).Call(
+					g.Id("r"), g.Id("activities").Dot(methodName),
 				)
 			}
 		})
@@ -57,8 +70,11 @@ func (svc *Service) genRegisterActivity(f *g.File, activity string) {
 	method := svc.methods[activity]
 	hasInput := !isEmpty(method.Input)
 	hasOutput := !isEmpty(method.Output)
-	f.Commentf("Register%sActivity registers a %s activity", activity, activity)
-	f.Func().Id(fmt.Sprintf("Register%sActivity", activity)).
+	methodName := svc.Names().RegisterActivitiy(activity)
+	activityName := svc.Names().ActivityNameConstant(activity)
+
+	f.Commentf("%s registers a %s activity", methodName, svc.Names().ActivityName(activity))
+	f.Func().Id(methodName).
 		Params(
 			g.Id("r").Qual(workerPkg, "Registry"),
 			g.Id("fn").Func().
@@ -78,7 +94,7 @@ func (svc *Service) genRegisterActivity(f *g.File, activity string) {
 		Block(
 			g.Id("r").Dot("RegisterActivityWithOptions").Call(
 				g.Id("fn"), g.Qual(activityPkg, "RegisterOptions").Block(
-					g.Id("Name").Op(":").Id(fmt.Sprintf("%sActivityName", activity)).Op(","),
+					g.Id("Name").Op(":").Id(activityName).Op(","),
 				),
 			),
 		)
@@ -86,7 +102,7 @@ func (svc *Service) genRegisterActivity(f *g.File, activity string) {
 
 // genActivityFuture generates a <Activity>Future struct
 func (svc *Service) genActivityFuture(f *g.File, activity string) {
-	future := fmt.Sprintf("%sFuture", activity)
+	future := svc.Names().ActivityFutureImpl(activity)
 
 	f.Commentf("%s describes a %s activity execution", future, activity)
 	f.Type().Id(future).Struct(
@@ -98,9 +114,9 @@ func (svc *Service) genActivityFuture(f *g.File, activity string) {
 func (svc *Service) genActivityFutureGetMethod(f *g.File, activity string) {
 	method := svc.methods[activity]
 	hasOutput := !isEmpty(method.Output)
-	future := fmt.Sprintf("%sFuture", activity)
+	future := svc.Names().ActivityFutureImpl(activity)
 
-	f.Commentf("Get blocks on a %s execution, returning the response", activity)
+	f.Comment("Get blocks on activity execution, returning the response")
 	f.Func().
 		Params(g.Id("f").Op("*").Id(future)).
 		Id("Get").
@@ -133,9 +149,9 @@ func (svc *Service) genActivityFutureGetMethod(f *g.File, activity string) {
 
 // genActivityFutureSelectMethod generates a <Workflow>Future's Select method
 func (svc *Service) genActivityFutureSelectMethod(f *g.File, activity string) {
-	future := fmt.Sprintf("%sFuture", activity)
+	future := svc.Names().ActivityFutureImpl(activity)
 
-	f.Commentf("Select adds the %s completion to the selector, callback can be nil", activity)
+	f.Comment("Select adds the activity completion to the selector, callback can be nil")
 	f.Func().
 		Params(g.Id("f").Op("*").Id(future)).
 		Id("Select").
@@ -160,202 +176,4 @@ func (svc *Service) genActivityFutureSelectMethod(f *g.File, activity string) {
 				),
 			),
 		)
-}
-
-// genActivityFunction generates a public <Activity>[Local] function
-func (svc *Service) genActivityFunction(f *g.File, activity string, local, async bool) {
-	method := svc.methods[activity]
-	opts := svc.activities[activity]
-	hasInput := !isEmpty(method.Input)
-	hasOutput := !isEmpty(method.Output)
-
-	methodName := method.GoName
-	var annotations []string
-	if local {
-		methodName = fmt.Sprintf("%sLocal", methodName)
-		annotations = append(annotations, "locally")
-	}
-	if async {
-		methodName = fmt.Sprintf("%sAsync", methodName)
-		annotations = append(annotations, "asynchronously")
-	}
-	sort.Slice(annotations, func(i, j int) bool {
-		return annotations[i] < annotations[j]
-	})
-
-	desc := method.Comments.Leading.String()
-	if desc != "" {
-		desc = strings.TrimSpace(strings.ReplaceAll(strings.TrimPrefix(desc, "//"), "\n//", ""))
-	} else {
-		desc = fmt.Sprintf("%s executes a(n) %s activity", methodName, activity)
-	}
-	if len(annotations) > 0 {
-		desc = fmt.Sprintf("%s (%s)", desc, strings.Join(annotations, ", "))
-	}
-
-	f.Comment(desc)
-	f.Func().
-		Id(methodName).
-		ParamsFunc(func(args *g.Group) {
-			args.Id("ctx").Qual(workflowPkg, "Context")
-			if local {
-				args.Id("fn").
-					Func().
-					ParamsFunc(func(fnargs *g.Group) {
-						fnargs.Qual("context", "Context")
-						if hasInput {
-							fnargs.Op("*").Id(method.Input.GoIdent.GoName)
-						}
-					}).
-					ParamsFunc(func(fnreturn *g.Group) {
-						if hasOutput {
-							fnreturn.Op("*").Id(method.Output.GoIdent.GoName)
-						}
-						fnreturn.Error()
-					})
-			}
-			if hasInput {
-				args.Id("req").Op("*").Id(method.Input.GoIdent.GoName)
-			}
-			if local {
-				args.Id("options").Op("...").Op("*").Qual(workflowPkg, "LocalActivityOptions")
-			} else {
-				args.Id("options").Op("...").Op("*").Qual(workflowPkg, "ActivityOptions")
-			}
-		}).
-		ParamsFunc(func(returnVals *g.Group) {
-			if async {
-				returnVals.Op("*").Id(fmt.Sprintf("%sFuture", method.GoName))
-			} else {
-				if hasOutput {
-					returnVals.Op("*").Id(method.Output.GoIdent.GoName)
-				}
-				returnVals.Error()
-			}
-		}).
-		BlockFunc(func(fn *g.Group) {
-			// initialize activity options if nil
-			if local {
-				fn.Var().Id("opts").Op("*").Qual(workflowPkg, "LocalActivityOptions")
-			} else {
-				fn.Var().Id("opts").Op("*").Qual(workflowPkg, "ActivityOptions")
-			}
-			fn.If(g.Len(g.Id("options")).Op(">").Lit(0).Op("&&").Id("options").Index(g.Lit(0)).Op("!=").Nil()).
-				Block(
-					g.Id("opts").Op("=").Id("options").Index(g.Lit(0)),
-				).
-				Else().
-				BlockFunc(func(bl *g.Group) {
-					optionsFn := "GetActivityOptions"
-					if local {
-						optionsFn = "GetLocalActivityOptions"
-					}
-					bl.Id("activityOpts").Op(":=").Qual(workflowPkg, optionsFn).Call(
-						g.Id("ctx"),
-					)
-					bl.Id("opts").Op("=").Op("&").Id("activityOpts")
-				})
-
-			// set default retry policy
-			if policy := opts.GetRetryPolicy(); policy != nil {
-				fn.If(g.Id("opts").Dot("RetryPolicy").Op("==").Nil()).Block(
-					g.Id("opts").Dot("RetryPolicy").Op("=").Op("&").Qual(temporalPkg, "RetryPolicy").ValuesFunc(func(fields *g.Group) {
-						if d := policy.GetInitialInterval(); d.IsValid() {
-							fields.Id("InitialInterval").Op(":").Id(strconv.FormatInt(d.AsDuration().Nanoseconds(), 10))
-						}
-						if d := policy.GetMaxInterval(); d.IsValid() {
-							fields.Id("MaximumInterval").Op(":").Id(strconv.FormatInt(d.AsDuration().Nanoseconds(), 10))
-						}
-						if n := policy.GetBackoffCoefficient(); n != 0 {
-							fields.Id("BackoffCoefficient").Op(":").Lit(n)
-						}
-						if n := policy.GetMaxAttempts(); n != 0 {
-							fields.Id("MaximumAttempts").Op(":").Lit(n)
-						}
-						if errs := policy.GetNonRetryableErrorTypes(); len(errs) > 0 {
-							fields.Id("NonRetryableErrorTypes").Op(":").Lit(errs)
-						}
-					}),
-				)
-			}
-
-			// set default heartbeat timeout
-			if timeout := opts.GetHeartbeatTimeout(); !local && timeout.IsValid() {
-				fn.If(g.Id("opts").Dot("HeartbeatTimeout").Op("==").Lit(0)).Block(
-					g.Id("opts").Dot("HeartbeatTimeout").Op("=").Id(strconv.FormatInt(timeout.AsDuration().Nanoseconds(), 10)).Comment(timeout.AsDuration().String()),
-				)
-			}
-
-			// set default schedule to close timeout
-			if timeout := opts.GetScheduleToCloseTimeout(); timeout.IsValid() {
-				fn.If(g.Id("opts").Dot("ScheduleToCloseTimeout").Op("==").Lit(0)).Block(
-					g.Id("opts").Dot("ScheduleToCloseTimeout").Op("=").Id(strconv.FormatInt(timeout.AsDuration().Nanoseconds(), 10)).Comment(timeout.AsDuration().String()),
-				)
-			}
-
-			// set default schedule to start timeout
-			if timeout := opts.GetScheduleToStartTimeout(); !local && timeout.IsValid() {
-				fn.If(g.Id("opts").Dot("ScheduleToStartTimeout").Op("==").Lit(0)).Block(
-					g.Id("opts").Dot("ScheduleToStartTimeout").Op("=").Id(strconv.FormatInt(timeout.AsDuration().Nanoseconds(), 10)).Comment(timeout.AsDuration().String()),
-				)
-			}
-
-			// set default start to close timeout
-			if timeout := opts.GetStartToCloseTimeout(); timeout.IsValid() {
-				fn.If(g.Id("opts").Dot("StartToCloseTimeout").Op("==").Lit(0)).Block(
-					g.Id("opts").Dot("StartToCloseTimeout").Op("=").Id(strconv.FormatInt(timeout.AsDuration().Nanoseconds(), 10)).Comment(timeout.AsDuration().String()),
-				)
-			}
-
-			// inject ctx with activity options
-			if local {
-				fn.Id("ctx").Op("=").Qual(workflowPkg, "WithLocalActivityOptions").Call(
-					g.Id("ctx"), g.Op("*").Id("opts"),
-				)
-
-			} else {
-				fn.Id("ctx").Op("=").Qual(workflowPkg, "WithActivityOptions").Call(
-					g.Id("ctx"), g.Op("*").Id("opts"),
-				)
-			}
-
-			// initialize activity reference
-			fn.Var().Id("activity").Any()
-			if local {
-				fn.If(g.Id("fn").Op("==").Nil()).
-					Block(
-						g.Id("activity").Op("=").Id(fmt.Sprintf("%sActivityName", activity)),
-					).
-					Else().
-					Block(
-						g.Id("activity").Op("=").Id("fn"),
-					)
-			} else {
-				fn.Id("activity").Op("=").Id(fmt.Sprintf("%sActivityName", method.GoName))
-			}
-
-			// initialize activity future
-			fn.Id("future").Op(":=").Op("&").Id(fmt.Sprintf("%sFuture", method.GoName)).ValuesFunc(func(values *g.Group) {
-				methodName := "ExecuteActivity"
-				if local {
-					methodName = "ExecuteLocalActivity"
-				}
-
-				values.Id("Future").Op(":").Qual(workflowPkg, methodName).CallFunc(func(args *g.Group) {
-					args.Id("ctx")
-					args.Id("activity")
-					if hasInput {
-						args.Id("req")
-					}
-				})
-			})
-
-			fn.ReturnFunc(func(returnVals *g.Group) {
-				if async {
-					returnVals.Add(g.Id("future"))
-				} else {
-					returnVals.Add(g.Id("future").Dot("Get").Call(g.Id("ctx")))
-				}
-			})
-		})
 }
